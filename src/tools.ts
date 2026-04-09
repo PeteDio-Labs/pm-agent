@@ -69,9 +69,10 @@ export function buildTools(state: LoopState, projectNumber: number): ToolDef[] {
         },
         required: ['path'],
       },
-      async execute(args: { path: string }) {
+      async execute(args: Record<string, unknown>) {
+        const { path } = args as { path: string };
         try {
-          const content = await readFile(args.path, 'utf-8');
+          const content = await readFile(path, 'utf-8');
           // Trim to relevant sections to save context
           const phasesMatch = content.match(/## Implementation Phases?\s*([\s\S]*?)(?=\n---|\n## [A-Z]|$)/);
           const relevant = phasesMatch ? phasesMatch[1] : content;
@@ -101,9 +102,10 @@ export function buildTools(state: LoopState, projectNumber: number): ToolDef[] {
         },
         required: ['tasks'],
       },
-      async execute(args: { tasks: string }) {
+      async execute(args: Record<string, unknown>) {
+        const { tasks } = args as { tasks: string };
         try {
-          const parsed = JSON.parse(args.tasks) as TaskInput[];
+          const parsed = JSON.parse(tasks) as TaskInput[];
           state.generatedTasks = parsed;
           const lines = parsed.map((t, i) =>
             `${i + 1}. [${t.priority}] ${t.title}\n   ${t.description}${t.dependsOn?.length ? `\n   deps: ${t.dependsOn.join(', ')}` : ''}`
