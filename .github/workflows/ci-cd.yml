@@ -32,13 +32,13 @@ jobs:
     steps:
       - name: Pull latest & restart
         run: |
-          ssh -o StrictHostKeyChecking=no ansible@192.168.50.113 \
+          ssh -o StrictHostKeyChecking=no pedro@192.168.50.113 \
             "cd /opt/pm-agent && git pull && bun install --frozen-lockfile && sudo systemctl restart pm-agent"
 
       - name: Health check
         run: |
           sleep 3
-          ssh -o StrictHostKeyChecking=no ansible@192.168.50.113 \
+          ssh -o StrictHostKeyChecking=no pedro@192.168.50.113 \
             "curl -sf http://localhost:3006/health | bun -e 'const d=await Bun.stdin.json();if(d.status!==\"ok\")process.exit(1)'"
 
       - name: Summary
