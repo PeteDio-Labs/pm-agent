@@ -5,14 +5,16 @@
 import { readFile } from 'node:fs/promises';
 import type { ToolDef } from '@petedio/shared/agents';
 import { listProjectItems, type TaskInput } from './github.js';
+import { DISPATCHABLE_AGENTS } from './schema.js';
 
 // Shared state — the loop populates this so index.ts can read it for approval
 export interface LoopState {
   boardSummary?: string;
   generatedTasks?: TaskInput[];
+  dispatches?: Array<{ agent: string; taskId: string; input: unknown }>;
 }
 
-export function buildTools(state: LoopState, projectNumber: number): ToolDef[] {
+export function buildTools(state: LoopState, projectNumber: number, mcBackendUrl?: string, allowedAgents?: readonly string[]): ToolDef[] {
   return [
     {
       name: 'get_board_status',
@@ -85,6 +87,68 @@ export function buildTools(state: LoopState, projectNumber: number): ToolDef[] {
           return trimmed || 'No implementation phases found in document';
         } catch (err) {
           return `Cannot read file: ${err instanceof Error ? err.message : err}`;
+        }
+      },
+    },
+
+    {
+      name: 'dispatch_to_agent',
+      description: `Dispatch a task to another agent via MC Backend. Available agents: ${DISPATCHABLE_AGENTS.join(', ')}`,
+      parameters: {
+        type: 'object',
+        properties: {
+          agentName: {
+            type: 'string',
+            description: `Agent to dispatch to. One of: ${DISPATCHABLE_AGENTS.join(', ')}`,
+          },
+          input: {
+            type: 'string',
+            description: 'JSON object with the agent-specific input payload',
+          },
+          reason: {
+            type: 'string',
+            description: 'One-sentence reason for dispatching this task',
+          },
+        },
+        required: ['agentName', 'input', 'reason'],
+      },
+      async execute(args: Record<string, unknown>) {
+        const { agentName, input: inputStr, reason } = args as { agentName: string; input: string; reason: string };
+
+        const allowed = allowedAgents ?? DISPATCHABLE_AGENTS;
+        if (!allowed.includes(agentName)) {
+          return `Agent "${agentName}" is not in the allowed dispatch list: ${allowed.join(', ')}`;
+        }
+
+        let parsedInput: unknown;
+        try {
+          parsedInput = JSON.parse(inputStr);
+        } catch {
+          return `Invalid input JSON: ${inputStr}`;
+        }
+
+        const url = `${mcBackendUrl}/api/v1/agents/${agentName}/trigger`;
+        try {
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ agentName, trigger: 'manual', input: parsedInput }),
+          });
+
+          if (!res.ok) {
+            const body = await res.text();
+            return `Dispatch failed (HTTP ${res.status}): ${body}`;
+          }
+
+          const data = await res.json() as { taskId?: string };
+          const taskId = data.taskId ?? 'unknown';
+
+          state.dispatches ??= [];
+          state.dispatches.push({ agent: agentName, taskId, input: parsedInput });
+
+          return `Dispatched ${agentName} — taskId: ${taskId}. Reason: ${reason}`;
+        } catch (err) {
+          return `Dispatch error: ${err instanceof Error ? err.message : String(err)}`;
         }
       },
     },

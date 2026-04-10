@@ -75,6 +75,21 @@ Group them by phase. For each task, determine:
 Then use propose_tasks with a JSON array of all extracted tasks.
 Do NOT invent tasks not in the document.
     `.trim();
+  } else if (input.mode === 'dispatch-tasks') {
+    userPrompt = `
+Review the GitHub Projects board using get_board_status.
+Identify tasks that are ready to be actioned by an autonomous agent — look for items in "In Progress" or "Ready" status that match agent capabilities.
+
+For each actionable task, use dispatch_to_agent to send it to the appropriate agent:
+- workstation-agent: coding tasks, file edits, bun/git ops on LXC 113
+- infra-agent: infrastructure changes, Ansible playbooks, Proxmox capacity
+- ops-investigator: health checks, incident investigation
+- knowledge-janitor: knowledge doc audits and cleanup
+- blog-agent: blog content generation
+
+Only dispatch tasks that are clearly ready (not blocked, not already running).
+Provide a brief summary of what you dispatched and why.
+    `.trim();
   } else {
     // full-cycle
     const planPart = input.planFile
@@ -92,7 +107,7 @@ ${planPart}
       model: OLLAMA_MODEL,
       system: 'You are a disciplined project manager. Be concise. Extract tasks exactly as written in documents — do not invent or expand scope.',
       userPrompt,
-      tools: buildTools(loopState, projectNumber),
+      tools: buildTools(loopState, projectNumber, MC_BACKEND_URL, input.agentsToDispatch),
       onIteration: (i, content) => {
         if (content) log.info({ taskId: payload.taskId, iteration: i }, 'pm-agent loop response');
       },
@@ -107,6 +122,18 @@ ${planPart}
       label: 'Board / Plan Summary',
       content: finalResponse || loopState.boardSummary || 'No summary generated',
     });
+
+    // If tasks were dispatched, add a dispatch summary artifact
+    if (loopState.dispatches && loopState.dispatches.length > 0) {
+      const dispatchLines = loopState.dispatches.map(d =>
+        `- **${d.agent}** — taskId: \`${d.taskId}\``
+      );
+      artifacts.push({
+        type: 'log' as const,
+        label: `${loopState.dispatches.length} task(s) dispatched`,
+        content: dispatchLines.join('\n'),
+      });
+    }
 
     // If tasks were proposed, gate them before creating
     if (loopState.generatedTasks && loopState.generatedTasks.length > 0) {
@@ -201,6 +228,44 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', agent: 'pm-agent', model: OLLAMA_MODEL });
 });
 
+// ─── Monday Dispatch Cron ─────────────────────────────────────────
+// Every Monday at 10:00 UTC — trigger a dispatch-tasks run via MC Backend
+
+function startDispatchCron(): void {
+  const CHECK_INTERVAL_MS = 60_000;
+  let lastRun: string | null = null;
+
+  setInterval(() => {
+    const now = new Date();
+    // Monday = 1, 10:00 UTC
+    if (now.getUTCDay() !== 1 || now.getUTCHours() !== 10) return;
+
+    const todayKey = now.toISOString().split('T')[0];
+    if (lastRun === todayKey) return;
+    lastRun = todayKey;
+
+    log.info('Monday dispatch cron firing — triggering dispatch-tasks via MC Backend');
+
+    fetch(`${MC_BACKEND_URL}/api/v1/agents/pm-agent/trigger`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agentName: 'pm-agent',
+        trigger: 'cron',
+        input: { mode: 'dispatch-tasks' },
+      }),
+    }).then(res => {
+      if (!res.ok) res.text().then(t => log.error({ status: res.status, body: t }, 'dispatch cron trigger failed'));
+      else log.info('dispatch-tasks cron dispatched successfully');
+    }).catch(err => {
+      log.error({ err: err instanceof Error ? err.message : err }, 'dispatch cron fetch error');
+    });
+  }, CHECK_INTERVAL_MS);
+
+  log.info('Monday dispatch cron started — fires at 10:00 UTC');
+}
+
 app.listen(PORT, () => {
   log.info({ port: PORT, model: OLLAMA_MODEL }, 'pm-agent listening');
+  startDispatchCron();
 });

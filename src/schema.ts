@@ -6,9 +6,14 @@ export const VALID_PROJECTS = [
   'infrastructure', 'notification-service', 'web-search', 'mcp-homelab',
 ] as const;
 
+export const DISPATCHABLE_AGENTS = [
+  'ops-investigator', 'blog-agent', 'knowledge-janitor',
+  'workstation-agent', 'infra-agent',
+] as const;
+
 export const PmAgentInputSchema = z.object({
-  mode: z.enum(['board-status', 'break-plan', 'full-cycle']).default('board-status')
-    .describe('board-status: summarize board | break-plan: parse a plan doc into tasks | full-cycle: both'),
+  mode: z.enum(['board-status', 'break-plan', 'full-cycle', 'dispatch-tasks']).default('board-status')
+    .describe('board-status: summarize board | break-plan: parse a plan doc into tasks | full-cycle: both | dispatch-tasks: review board and dispatch ready tasks to agents'),
   projectNumber: z.coerce.number().default(1)
     .describe('GitHub Project number (1 = PeteDio Labs Backlog)'),
   projectFilter: z.enum(VALID_PROJECTS).optional()
@@ -19,6 +24,8 @@ export const PmAgentInputSchema = z.object({
     .describe('Project tag to assign generated tasks'),
   repo: z.string().optional()
     .describe('Optional repo for issue creation (e.g. PeteDio-Labs/blog-api)'),
+  agentsToDispatch: z.array(z.enum(DISPATCHABLE_AGENTS)).optional()
+    .describe('Allowlist of agents that may be dispatched in dispatch-tasks mode (defaults to all)'),
 });
 
 export type PmAgentInput = z.infer<typeof PmAgentInputSchema>;
