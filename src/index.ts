@@ -2,10 +2,11 @@
  * pm-agent — Project management agent.
  *
  * Modes:
- *   board-status: reads GitHub board, produces a summary report
- *   break-plan:   reads a plan doc, uses Gemma 4 to extract tasks,
- *                 requests MC approval, then creates tasks on the board
- *   full-cycle:   board-status + break-plan
+ *   board-status:   reads GitHub board directly → deterministic summary (no LLM)
+ *   break-plan:     reads a plan doc, uses Gemma 4 to extract tasks,
+ *                   requests MC approval, then creates tasks on the board
+ *   full-cycle:     board-status (deterministic) + break-plan (LLM if planFile provided)
+ *   dispatch-tasks: reviews board + routes tasks to agents via Gemma 4 (LLM)
  *
  * Approval gate: task creation is always gated — agent pauses and
  * posts an approval card to MC before writing anything to GitHub.
@@ -15,9 +16,9 @@ import express from 'express';
 import pino from 'pino';
 import { AgentReporter, runToolLoop } from '@petedio/shared/agents';
 import { TaskPayloadSchema } from '@petedio/shared/agents';
-import { PmAgentInputSchema } from './schema.js';
+import { PmAgentInputSchema, type PmAgentInput } from './schema.js';
 import { buildTools, type LoopState } from './tools.js';
-import { createTasksOnBoard } from './github.js';
+import { listProjectItems, createTasksOnBoard, type ProjectItem } from './github.js';
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 const PORT = parseInt(process.env.PORT ?? '3006', 10);
@@ -26,7 +27,65 @@ const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? 'gemma4';
 const MC_BACKEND_URL = process.env.MC_BACKEND_URL ?? 'http://localhost:3000';
 const GITHUB_PROJECT_NUMBER = parseInt(process.env.GITHUB_PROJECT_NUMBER ?? '1', 10);
 
+// ─── Board summary (deterministic — no LLM) ───────────────────────
+
+function formatBoardSummary(items: ProjectItem[], filter?: string): string {
+  const filtered = filter
+    ? items.filter(i =>
+        i.project?.toLowerCase().includes(filter.toLowerCase()) ||
+        i.title?.toLowerCase().includes(filter.toLowerCase())
+      )
+    : items;
+
+  if (filtered.length === 0) return 'No items found on board.';
+
+  const byStatus: Record<string, typeof filtered> = {};
+  for (const item of filtered) {
+    const s = item.status || 'No Status';
+    if (!byStatus[s]) byStatus[s] = [];
+    byStatus[s].push(item);
+  }
+
+  const lines: string[] = [`Board status (${filtered.length} items):`];
+  for (const [status, its] of Object.entries(byStatus)) {
+    lines.push(`\n**${status}** (${its.length}):`);
+    for (const i of its) {
+      const priority = i.priority ? ` [${i.priority}]` : '';
+      lines.push(`  - ${i.title}${priority}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
 // ─── Agent Logic ──────────────────────────────────────────────────
+
+async function runBoardStatus(
+  payload: ReturnType<typeof TaskPayloadSchema.parse>,
+  input: PmAgentInput,
+  reporter: InstanceType<typeof AgentReporter>,
+  startMs: number,
+): Promise<void> {
+  const projectNumber = input.projectNumber ?? GITHUB_PROJECT_NUMBER;
+  await reporter.running('Fetching GitHub Projects board...');
+
+  const items = await listProjectItems(projectNumber);
+  const summary = formatBoardSummary(items, input.projectFilter);
+
+  log.info({ taskId: payload.taskId, itemCount: items.length }, 'board-status complete');
+
+  await reporter.complete({
+    taskId: payload.taskId,
+    agentName: 'pm-agent',
+    status: 'complete',
+    summary: `Board fetched — ${items.length} items`,
+    artifacts: [
+      { type: 'summary', label: 'Board Summary', content: summary },
+    ],
+    durationMs: Date.now() - startMs,
+    completedAt: new Date().toISOString(),
+  });
+}
 
 async function runPmAgent(payload: ReturnType<typeof TaskPayloadSchema.parse>): Promise<void> {
   const startMs = Date.now();
@@ -42,23 +101,47 @@ async function runPmAgent(payload: ReturnType<typeof TaskPayloadSchema.parse>): 
   await reporter.running(`Starting pm-agent in mode: ${input.mode}`);
   log.info({ taskId: payload.taskId, input }, 'pm-agent starting');
 
+  // ── board-status: fully deterministic, no LLM ─────────────────
+  if (input.mode === 'board-status') {
+    await runBoardStatus(payload, input, reporter, startMs);
+    return;
+  }
+
+  // ── all other modes: may use LLM ──────────────────────────────
+
   const loopState: LoopState = {};
+  const artifacts = [];
 
-  // ── Build prompt based on mode ──────────────────────────────────
+  // full-cycle: board part is deterministic, plan part may use LLM
+  if (input.mode === 'full-cycle') {
+    await reporter.running('Fetching board status...');
+    const items = await listProjectItems(projectNumber);
+    loopState.boardSummary = formatBoardSummary(items, input.projectFilter);
+    artifacts.push({
+      type: 'summary' as const,
+      label: 'Board Summary',
+      content: loopState.boardSummary,
+    });
 
+    if (!input.planFile) {
+      // No plan file — just the board summary, no LLM needed
+      await reporter.complete({
+        taskId: payload.taskId,
+        agentName: 'pm-agent',
+        status: 'complete',
+        summary: `Board fetched — ${items.length} items`,
+        artifacts,
+        durationMs: Date.now() - startMs,
+        completedAt: new Date().toISOString(),
+      });
+      return;
+    }
+  }
+
+  // Build LLM prompt for break-plan, dispatch-tasks, and full-cycle with planFile
   let userPrompt = '';
 
-  if (input.mode === 'board-status') {
-    userPrompt = `
-Review the current GitHub Projects board${input.projectFilter ? ` filtered to "${input.projectFilter}"` : ''}.
-Use get_board_status to fetch the board, then write a concise status report:
-- Overall health (on track / behind / blocked)
-- What is in progress
-- Any blockers
-- Recommended next actions
-Keep the summary under 300 words.
-    `.trim();
-  } else if (input.mode === 'break-plan') {
+  if (input.mode === 'break-plan') {
     if (!input.planFile) {
       await reporter.fail('break-plan mode requires planFile input');
       return;
@@ -91,13 +174,9 @@ Only dispatch tasks that are clearly ready (not blocked, not already running).
 Provide a brief summary of what you dispatched and why.
     `.trim();
   } else {
-    // full-cycle
-    const planPart = input.planFile
-      ? `Also read the plan at "${input.planFile}" and use propose_tasks to extract remaining tasks.`
-      : 'No plan file provided — skip task extraction.';
+    // full-cycle with planFile
     userPrompt = `
-First, get the board status${input.projectFilter ? ` for "${input.projectFilter}"` : ''} and write a summary.
-${planPart}
+Read the plan at "${input.planFile}" and use propose_tasks to extract remaining tasks.
     `.trim();
   }
 
@@ -114,28 +193,34 @@ ${planPart}
     });
 
     const durationMs = Date.now() - startMs;
-    const artifacts = [];
 
-    // Always produce a summary artifact
-    artifacts.push({
-      type: 'summary' as const,
-      label: 'Board / Plan Summary',
-      content: finalResponse || loopState.boardSummary || 'No summary generated',
-    });
-
-    // If tasks were dispatched, add a dispatch summary artifact
-    if (loopState.dispatches && loopState.dispatches.length > 0) {
-      const dispatchLines = loopState.dispatches.map(d =>
-        `- **${d.agent}** — taskId: \`${d.taskId}\``
-      );
+    // Always produce a summary artifact (board summary already added for full-cycle above)
+    if (input.mode !== 'full-cycle') {
       artifacts.push({
-        type: 'log' as const,
-        label: `${loopState.dispatches.length} task(s) dispatched`,
-        content: dispatchLines.join('\n'),
+        type: 'summary' as const,
+        label: 'Board / Plan Summary',
+        content: finalResponse || loopState.boardSummary || 'No summary generated',
+      });
+    } else if (finalResponse) {
+      artifacts.push({
+        type: 'summary' as const,
+        label: 'Plan Summary',
+        content: finalResponse,
       });
     }
 
-    // If tasks were proposed, gate them before creating
+    // Dispatch log
+    if (loopState.dispatches && loopState.dispatches.length > 0) {
+      artifacts.push({
+        type: 'log' as const,
+        label: `${loopState.dispatches.length} task(s) dispatched`,
+        content: loopState.dispatches.map(d =>
+          `- **${d.agent}** — taskId: \`${d.taskId}\``
+        ).join('\n'),
+      });
+    }
+
+    // Task proposal approval gate
     if (loopState.generatedTasks && loopState.generatedTasks.length > 0) {
       const taskPreview = loopState.generatedTasks
         .map((t, i) => `${i + 1}. [${t.priority}] **${t.title}**\n   ${t.description}`)
@@ -225,7 +310,7 @@ app.post('/run', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', agent: 'pm-agent', model: OLLAMA_MODEL });
+  res.json({ status: 'ok', agent: 'pm-agent' });
 });
 
 // ─── Monday Dispatch Cron ─────────────────────────────────────────
@@ -237,7 +322,6 @@ function startDispatchCron(): void {
 
   setInterval(() => {
     const now = new Date();
-    // Monday = 1, 10:00 UTC
     if (now.getUTCDay() !== 1 || now.getUTCHours() !== 10) return;
 
     const todayKey = now.toISOString().split('T')[0];
@@ -266,6 +350,6 @@ function startDispatchCron(): void {
 }
 
 app.listen(PORT, () => {
-  log.info({ port: PORT, model: OLLAMA_MODEL }, 'pm-agent listening');
+  log.info({ port: PORT }, 'pm-agent listening');
   startDispatchCron();
 });
