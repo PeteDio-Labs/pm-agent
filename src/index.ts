@@ -19,13 +19,20 @@ import { TaskPayloadSchema } from '@petedio/shared/agents';
 import { PmAgentInputSchema, type PmAgentInput } from './schema.js';
 import { buildTools, type LoopState } from './tools.js';
 import { listProjectItems, createTasksOnBoard, type ProjectItem } from './github.js';
+import {
+  computeBoardDiff, applySyncBoard,
+  buildWeeklyReport, postWeeklyReportToDiscord,
+  computeCloseDone, applyCloseDone,
+} from './sync.js';
+import { resolveOllamaUrl } from './ollamaRouter.js';
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 const PORT = parseInt(process.env.PORT ?? '3006', 10);
-const OLLAMA_URL = process.env.OLLAMA_URL ?? 'http://192.168.50.59:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? 'gemma4';
+const OLLAMA_URL = resolveOllamaUrl(OLLAMA_MODEL);
 const MC_BACKEND_URL = process.env.MC_BACKEND_URL ?? 'http://localhost:3000';
 const GITHUB_PROJECT_NUMBER = parseInt(process.env.GITHUB_PROJECT_NUMBER ?? '1', 10);
+// PLANNING_ROOT consumed by sync.ts via process.env directly
 
 // ─── Board summary (deterministic — no LLM) ───────────────────────
 
@@ -101,9 +108,111 @@ async function runPmAgent(payload: ReturnType<typeof TaskPayloadSchema.parse>): 
   await reporter.running(`Starting pm-agent in mode: ${input.mode}`);
   log.info({ taskId: payload.taskId, input }, 'pm-agent starting');
 
-  // ── board-status: fully deterministic, no LLM ─────────────────
+  // ── board-status ──────────────────────────────────────────────
   if (input.mode === 'board-status') {
     await runBoardStatus(payload, input, reporter, startMs);
+    return;
+  }
+
+  // ── sync-board ────────────────────────────────────────────────
+  if (input.mode === 'sync-board') {
+    await reporter.running('Diffing planning docs against GitHub board...');
+    const diff = await computeBoardDiff(projectNumber);
+
+    if (!diff.toAdd.length && !diff.toClose.length) {
+      await reporter.complete({
+        taskId: payload.taskId, agentName: 'pm-agent', status: 'complete',
+        summary: 'Board in sync — no changes needed',
+        artifacts: [{ type: 'log', label: 'Sync result', content: diff.preview }],
+        durationMs: Date.now() - startMs, completedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const approval = await reporter.requestApproval({
+      actionType: 'create-tasks',
+      description: `Sync board: add ${diff.toAdd.length} items, close ${diff.toClose.length} items`,
+      preview: diff.preview,
+    });
+
+    if (approval.outcome === 'approved') {
+      await reporter.running('Applying board sync...');
+      const result = await applySyncBoard(diff, projectNumber);
+      await reporter.complete({
+        taskId: payload.taskId, agentName: 'pm-agent', status: 'complete',
+        summary: result,
+        artifacts: [
+          { type: 'log', label: 'Sync preview', content: diff.preview },
+          { type: 'log', label: 'Result', content: result },
+        ],
+        durationMs: Date.now() - startMs, completedAt: new Date().toISOString(),
+      });
+    } else {
+      await reporter.complete({
+        taskId: payload.taskId, agentName: 'pm-agent', status: 'complete',
+        summary: 'Sync cancelled',
+        artifacts: [{ type: 'log', label: 'Sync preview (not applied)', content: diff.preview }],
+        durationMs: Date.now() - startMs, completedAt: new Date().toISOString(),
+      });
+    }
+    return;
+  }
+
+  // ── weekly-report ─────────────────────────────────────────────
+  if (input.mode === 'weekly-report') {
+    await reporter.running('Building weekly report...');
+    const report = await buildWeeklyReport(projectNumber);
+    await postWeeklyReportToDiscord(report);
+    await reporter.complete({
+      taskId: payload.taskId, agentName: 'pm-agent', status: 'complete',
+      summary: 'Weekly report posted to Discord',
+      artifacts: [{ type: 'summary', label: 'Weekly Report', content: report }],
+      durationMs: Date.now() - startMs, completedAt: new Date().toISOString(),
+    });
+    return;
+  }
+
+  // ── close-done ────────────────────────────────────────────────
+  if (input.mode === 'close-done') {
+    await reporter.running('Computing done items to reconcile with plans...');
+    const result = await computeCloseDone(projectNumber);
+
+    if (!result.markedDoneInPlans.length && !result.plansToArchive.length) {
+      await reporter.complete({
+        taskId: payload.taskId, agentName: 'pm-agent', status: 'complete',
+        summary: 'Nothing to close — plans already in sync with board',
+        artifacts: [{ type: 'log', label: 'Result', content: result.preview }],
+        durationMs: Date.now() - startMs, completedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const approval = await reporter.requestApproval({
+      actionType: 'write-file',
+      description: `Mark ${result.markedDoneInPlans.length} tasks done in plans; archive ${result.plansToArchive.length} complete plan(s)`,
+      preview: result.preview,
+    });
+
+    if (approval.outcome === 'approved') {
+      await reporter.running('Applying close-done changes...');
+      const outcome = await applyCloseDone(result);
+      await reporter.complete({
+        taskId: payload.taskId, agentName: 'pm-agent', status: 'complete',
+        summary: outcome,
+        artifacts: [
+          { type: 'log', label: 'Changes preview', content: result.preview },
+          { type: 'log', label: 'Result', content: outcome },
+        ],
+        durationMs: Date.now() - startMs, completedAt: new Date().toISOString(),
+      });
+    } else {
+      await reporter.complete({
+        taskId: payload.taskId, agentName: 'pm-agent', status: 'complete',
+        summary: 'Close-done cancelled',
+        artifacts: [{ type: 'log', label: 'Preview (not applied)', content: result.preview }],
+        durationMs: Date.now() - startMs, completedAt: new Date().toISOString(),
+      });
+    }
     return;
   }
 
@@ -328,22 +437,26 @@ function startDispatchCron(): void {
     if (lastRun === todayKey) return;
     lastRun = todayKey;
 
-    log.info('Monday dispatch cron firing — triggering dispatch-tasks via MC Backend');
+    log.info('Monday cron firing — sync-board → dispatch-tasks → weekly-report');
 
-    fetch(`${MC_BACKEND_URL}/api/v1/agents/pm-agent/trigger`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        agentName: 'pm-agent',
-        trigger: 'cron',
-        input: { mode: 'dispatch-tasks' },
-      }),
-    }).then(res => {
-      if (!res.ok) res.text().then(t => log.error({ status: res.status, body: t }, 'dispatch cron trigger failed'));
-      else log.info('dispatch-tasks cron dispatched successfully');
-    }).catch(err => {
-      log.error({ err: err instanceof Error ? err.message : err }, 'dispatch cron fetch error');
-    });
+    const trigger = async (mode: string) => {
+      const res = await fetch(`${MC_BACKEND_URL}/api/v1/agents/pm-agent/trigger`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentName: 'pm-agent', trigger: 'cron', input: { mode } }),
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        log.error({ mode, status: res.status, body: t }, 'Monday cron trigger failed');
+      } else {
+        log.info({ mode }, 'Monday cron trigger queued');
+      }
+    };
+
+    trigger('sync-board').catch(() => {});
+    // dispatch-tasks and weekly-report fire sequentially with a short gap
+    setTimeout(() => trigger('dispatch-tasks').catch(() => {}), 5_000);
+    setTimeout(() => trigger('weekly-report').catch(() => {}), 10_000);
   }, CHECK_INTERVAL_MS);
 
   log.info('Monday dispatch cron started — fires at 10:00 UTC');

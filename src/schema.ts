@@ -12,8 +12,8 @@ export const DISPATCHABLE_AGENTS = [
 ] as const;
 
 export const PmAgentInputSchema = z.object({
-  mode: z.enum(['board-status', 'break-plan', 'full-cycle', 'dispatch-tasks']).default('board-status')
-    .describe('board-status: summarize board | break-plan: parse a plan doc into tasks | full-cycle: both | dispatch-tasks: review board and dispatch ready tasks to agents'),
+  mode: z.enum(['board-status', 'break-plan', 'full-cycle', 'dispatch-tasks', 'sync-board', 'weekly-report', 'close-done']).default('board-status')
+    .describe('board-status: summarize board | break-plan: parse plan doc into tasks | full-cycle: both | dispatch-tasks: route ready items to agents | sync-board: diff plans vs board and propose changes | weekly-report: digest + Discord | close-done: mark done items in plans and archive complete plans'),
   projectNumber: z.coerce.number().default(1)
     .describe('GitHub Project number (1 = PeteDio Labs Backlog)'),
   projectFilter: z.enum(VALID_PROJECTS).optional()

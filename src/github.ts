@@ -50,7 +50,25 @@ export async function listProjectItems(projectNumber: number): Promise<ProjectIt
   }));
 }
 
-// ─── Write (gated — call only after approval) ─────────────────────
+// ─── Write (gated — call only after approval) ────────────────────
+
+export async function updateItemStatus(
+  projectNumber: number,
+  itemId: string,
+  status: string,
+): Promise<void> {
+  const projectId = await getProjectId(projectNumber);
+  await setItemFields(projectNumber, projectId, itemId, { status });
+}
+
+export async function deleteItem(
+  projectNumber: number,
+  itemId: string,
+): Promise<void> {
+  const projectId = await getProjectId(projectNumber);
+  await $`gh project item-delete ${projectNumber} --owner ${GITHUB_ORG} --id ${itemId}`.quiet();
+  void projectId; // getProjectId called for side-effect parity; delete uses projectNumber directly
+}
 
 async function getProjectId(projectNumber: number): Promise<string> {
   const result = await $`gh project view ${projectNumber} --owner ${GITHUB_ORG} --format json`.quiet().text();
